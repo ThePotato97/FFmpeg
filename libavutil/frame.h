@@ -312,7 +312,17 @@ enum AVFrameSideDataType {
      * struct defined in libavutil/gain_map.h.
      */
     AV_FRAME_DATA_GAIN_MAP_PARAMS,
+
+    /**
+     * Dolby Atmos objects for spatial audio: one AVAtmosObject (libavutil/atmos_objects.h) per
+     * channel of the frame, describing what each channel is (a static bed channel, a positioned
+     * object, or unused) for its whole duration. Set by the libatmos decoders.
+     */
+    AV_FRAME_DATA_ATMOS_OBJECTS,
 };
+
+/** AV_FRAME_DATA_ATMOS_OBJECTS exists (a fork addition). */
+#define AV_FRAME_DATA_ATMOS_OBJECTS_AVAILABLE 1
 
 enum AVActiveFormatDescription {
     AV_AFD_SAME         = 8,

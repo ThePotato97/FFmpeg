@@ -2056,6 +2056,7 @@ EXTERNAL_LIBRARY_LIST="
     libaom
     libaribcaption
     libass
+    libatmos
     libbluray
     libbs2b
     libcaca
@@ -3797,6 +3798,9 @@ libastcenc_encoder_deps="libastcenc"
 libastcenc_decoder_deps="libastcenc"
 libcodec2_decoder_deps="libcodec2"
 libcodec2_encoder_deps="libcodec2"
+libatmos_eac3_decoder_deps="libatmos"
+libatmos_eac3_decoder_select="eac3_decoder"
+libatmos_truehd_decoder_deps="libatmos"
 libdav1d_decoder_deps="libdav1d"
 libdav1d_decoder_select="itut_t35"
 libdavs2_decoder_deps="libdavs2"
@@ -7235,6 +7239,7 @@ libastcenc_extralibs="-lastcenc -lstdc++ $libm_extralibs"
 enabled lv2               && require_pkg_config lv2 lilv-0 "lilv/lilv.h" lilv_world_new
 enabled libiec61883       && require libiec61883 libiec61883/iec61883.h iec61883_cmp_connect -lraw1394 -lavc1394 -lrom1394 -liec61883
 enabled libass            && require_pkg_config libass "libass >= 0.11.0" ass/ass.h ass_library_init
+enabled libatmos          && require_pkg_config libatmos atmos-render atmos_objects.h atmos_objects_create
 enabled libbluray         && require_pkg_config libbluray libbluray libbluray/bluray.h bd_open
 enabled libbs2b           && require_pkg_config libbs2b libbs2b bs2b.h bs2b_open
 enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas

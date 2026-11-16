@@ -5,6 +5,7 @@ HEADERS = adler32.h                                                     \
           aes.h                                                         \
           aes_ctr.h                                                     \
           ambient_viewing_environment.h                                 \
+          atmos_objects.h                                               \
           attributes.h                                                  \
           audio_fifo.h                                                  \
           avassert.h                                                    \
