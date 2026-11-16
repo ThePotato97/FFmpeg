@@ -45,6 +45,9 @@
 #include "jni.h"
 #include "mediacodec_wrapper.h"
 #include "mediacodecdec_common.h"
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+#include "mediacodec_dovi.h"
+#endif
 
 typedef struct MediaCodecContext {
 
@@ -60,6 +63,10 @@ typedef struct MediaCodecContext {
     int use_ndk_codec;
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    MediaCodecDoviContext dovi;
+#endif
 } MediaCodecContext;
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
@@ -70,6 +77,10 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
     s->ctx = NULL;
 
     av_packet_unref(&s->buffered_pkt);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    ff_mediacodec_dovi_uninit(&s->dovi);
+#endif
 
     return 0;
 }
@@ -353,6 +364,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         ret = hevc_set_extradata(avctx, format);
         if (ret < 0)
             goto done;
+
+        ff_mediacodec_dovi_init(&s->dovi, avctx);
         break;
 #endif
 #if CONFIG_MPEG2_MEDIACODEC_DECODER
@@ -488,6 +501,24 @@ done:
     return ret;
 }
 
+/* A decoded frame, with the Dolby Vision metadata of its packet's RPU, which
+ * MediaCodec leaves out. */
+static int receive(AVCodecContext *avctx, AVFrame *frame, bool wait)
+{
+    MediaCodecContext *s = avctx->priv_data;
+    int ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, wait);
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_HEVC) {
+        int err = ff_mediacodec_dovi_frame(&s->dovi, frame);
+        if (err < 0) {
+            av_frame_unref(frame);
+            return err;
+        }
+    }
+#endif
+    return ret;
+}
+
 static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     MediaCodecContext *s = avctx->priv_data;
@@ -503,7 +534,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     }
 
     /* poll for new frame */
-    ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, false);
+    ret = receive(avctx, frame, false);
     if (ret != AVERROR(EAGAIN))
         return ret;
 
@@ -514,7 +545,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             index = ff_AMediaCodec_dequeueInputBuffer(s->ctx->codec, 0);
             if (index < 0) {
                 /* no space, block for an output frame to appear */
-                ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+                ret = receive(avctx, frame, true);
                 /* Try again if both input port and output port return EAGAIN.
                  * If no data is consumed and no frame in output, it can make
                  * both avcodec_send_packet() and avcodec_receive_frame()
@@ -555,14 +586,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
         /* fetch new packet or eof */
         ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+        if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_HEVC) {
+            int err = ff_mediacodec_dovi_packet(&s->dovi, avctx, &s->buffered_pkt);
+            if (err < 0)
+                return err;
+        }
+#endif
         if (ret == AVERROR_EOF) {
             AVPacket null_pkt = { 0 };
             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
             if (ret < 0)
                 return ret;
-            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+            return receive(avctx, frame, true);
         } else if (ret == AVERROR(EAGAIN) && s->ctx->current_input_buffer < 0) {
-            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+            return receive(avctx, frame, true);
         } else if (ret < 0) {
             return ret;
         }
@@ -576,6 +614,10 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
     MediaCodecContext *s = avctx->priv_data;
 
     av_packet_unref(&s->buffered_pkt);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    ff_mediacodec_dovi_flush(&s->dovi);
+#endif
 
     ff_mediacodec_dec_flush(avctx, s->ctx);
 }
