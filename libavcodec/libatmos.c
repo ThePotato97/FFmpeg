@@ -27,9 +27,13 @@
  *
  * For E-AC-3 FFmpeg's eac3 decoder decodes the core, set up as Windows' decoder's RF mode, and
  * atmos-render rebuilds the objects from it and the bitstream's EMDF (JOC, OAMD).
+ *
+ * libatmos_speakers_* instead render the stream for two built-in speakers, as Dolby Atmos for
+ * built-in speakers does on Windows: plain stereo at 48 kHz that any player can play.
  */
 
 #include <atmos_objects.h>
+#include <atmos_render.h>
 #include <string.h>
 
 #include "libavutil/atmos_objects.h"
@@ -59,11 +63,18 @@ typedef struct LibAtmosContext {
     int64_t origin;
     int has_origin;
     int eof;
+    /* libatmos_speakers_*: the render session, its output not yet returned, and how many stereo
+     * frames it has given since the origin */
+    AtmosRenderSession *session;
+    float *pending;
+    size_t pending_frames, pending_cap;
+    uint64_t rendered;
 } LibAtmosContext;
 
 static int open_core(AVCodecContext *avctx, LibAtmosContext *s)
 {
-    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_EAC3);
+    const AVCodec *codec = avcodec_find_decoder(avctx->codec_id == AV_CODEC_ID_AC3 ?
+                                                AV_CODEC_ID_AC3 : AV_CODEC_ID_EAC3);
     AVDictionary *opts = NULL;
     int ret;
 
@@ -122,6 +133,24 @@ static av_cold int libatmos_close(AVCodecContext *avctx)
     return 0;
 }
 
+/* Speakers: queue the `frames` stereo frames the session's last call gave. */
+static int keep_output(LibAtmosContext *s, size_t frames)
+{
+    if (!frames)
+        return 0;
+    if (s->pending_frames + frames > s->pending_cap) {
+        size_t cap = FFMAX(s->pending_cap * 2, s->pending_frames + frames);
+        float *p = av_realloc_array(s->pending, cap, 2 * sizeof(float));
+        if (!p)
+            return AVERROR(ENOMEM);
+        s->pending = p;
+        s->pending_cap = cap;
+    }
+    memcpy(s->pending + 2 * s->pending_frames, ar_output(s->session), frames * 2 * sizeof(float));
+    s->pending_frames += frames;
+    return 0;
+}
+
 /* The core's decode so far, interleaved, into atmos-render. */
 static int push_core(AVCodecContext *avctx, LibAtmosContext *s)
 {
@@ -150,7 +179,15 @@ static int push_core(AVCodecContext *avctx, LibAtmosContext *s)
             for (int n = 0; n < f->nb_samples; n++)
                 s->interleaved[n * channels + c] = plane[n];
         }
-        atmos_objects_push_pcm(s->objects, channels, (uint32_t)mask, s->interleaved, f->nb_samples);
+        if (s->session) {
+            size_t n = ar_push_pcm(s->session, s->interleaved, size, channels, (uint32_t)mask);
+            if ((ret = keep_output(s, n)) < 0) {
+                av_frame_unref(f);
+                return ret;
+            }
+        } else {
+            atmos_objects_push_pcm(s->objects, channels, (uint32_t)mask, s->interleaved, f->nb_samples);
+        }
         av_frame_unref(f);
     }
     return ret == AVERROR(EAGAIN) || ret == AVERROR_EOF ? 0 : ret;
@@ -166,9 +203,13 @@ static int take_packet(AVCodecContext *avctx, LibAtmosContext *s)
             if ((ret = push_core(avctx, s)) < 0)
                 return ret;
         }
-        atmos_objects_end(s->objects);
+        ret = 0;
+        if (s->session)
+            ret = keep_output(s, ar_finish(s->session));
+        else
+            atmos_objects_end(s->objects);
         s->eof = 1;
-        return 0;
+        return ret;
     }
     if (ret < 0)
         return ret;
@@ -179,7 +220,14 @@ static int take_packet(AVCodecContext *avctx, LibAtmosContext *s)
     }
     /* The bitstream first, for its frames' EMDF, then the core's PCM, which atmos-render lines up
      * with them (as atmos-render's decoder package does). */
-    atmos_objects_push(s->objects, s->pkt->data, s->pkt->size);
+    if (s->session) {
+        if ((ret = keep_output(s, ar_push(s->session, s->pkt->data, s->pkt->size))) < 0) {
+            av_packet_unref(s->pkt);
+            return ret;
+        }
+    } else {
+        atmos_objects_push(s->objects, s->pkt->data, s->pkt->size);
+    }
     if (s->core) {
         ret = avcodec_send_packet(s->core, s->pkt);
         if (ret < 0 && ret != AVERROR(EAGAIN))
@@ -243,7 +291,7 @@ const FFCodec ff_libatmos_##short_##_decoder = {                                
     CODEC_LONG_NAME(long_ " to Dolby Atmos objects (atmos-render)"),          \
     .p.type         = AVMEDIA_TYPE_AUDIO,                                         \
     .p.id           = id_,                                                         \
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,                      \
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_CHANNEL_CONF, \
     .p.wrapper_name = "libatmos",                                                 \
     .priv_data_size = sizeof(LibAtmosContext),                                    \
     .init           = libatmos_init,                                              \
@@ -256,3 +304,115 @@ const FFCodec ff_libatmos_##short_##_decoder = {                                
 
 LIBATMOS_DECODER(truehd, "TrueHD", AV_CODEC_ID_TRUEHD)
 LIBATMOS_DECODER(eac3, "E-AC-3", AV_CODEC_ID_EAC3)
+
+/* ---- libatmos_speakers_*: rendered for built-in speakers ---- */
+
+static AtmosRenderSession *speaker_session(enum AVCodecID id)
+{
+    /* Every element Near and Windows' loudness: Windows' own renderer for a stereo endpoint. */
+    AtmosRenderSession *session = id == AV_CODEC_ID_TRUEHD ? ar_new(1) : ar_new_eac3(1, true);
+
+    if (session && !ar_render_for_speakers(session)) {
+        ar_drop(session);
+        session = NULL;
+    }
+    return session;
+}
+
+static av_cold int libatmos_speakers_init(AVCodecContext *avctx)
+{
+    LibAtmosContext *s = avctx->priv_data;
+    int ret;
+
+    if (avctx->sample_rate && avctx->sample_rate != RATE) {
+        av_log(avctx, AV_LOG_ERROR, "Only %d Hz is supported, not %d\n", RATE, avctx->sample_rate);
+        return AVERROR(ENOSYS);
+    }
+    s->session = speaker_session(avctx->codec_id);
+    s->pkt = av_packet_alloc();
+    if (!s->session || !s->pkt)
+        return AVERROR(ENOMEM);
+    if (avctx->codec_id != AV_CODEC_ID_TRUEHD && (ret = open_core(avctx, s)) < 0)
+        return ret;
+
+    avctx->sample_rate = RATE;
+    avctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+    return 0;
+}
+
+static av_cold int libatmos_speakers_close(AVCodecContext *avctx)
+{
+    LibAtmosContext *s = avctx->priv_data;
+
+    ar_drop(s->session);
+    s->session = NULL;
+    av_freep(&s->pending);
+    s->pending_frames = s->pending_cap = 0;
+    return libatmos_close(avctx);
+}
+
+static int libatmos_speakers_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    LibAtmosContext *s = avctx->priv_data;
+    size_t n;
+    int ret;
+
+    while (!s->pending_frames) {
+        if (s->eof)
+            return AVERROR_EOF;
+        if ((ret = take_packet(avctx, s)) < 0)
+            return ret;
+    }
+
+    n = s->pending_frames;
+    frame->nb_samples = n;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+        return ret;
+    for (size_t i = 0; i < n; i++) {
+        ((float *)frame->extended_data[0])[i] = s->pending[2 * i];
+        ((float *)frame->extended_data[1])[i] = s->pending[2 * i + 1];
+    }
+    frame->pts = s->origin;
+    if (avctx->pkt_timebase.num && avctx->pkt_timebase.den)
+        frame->pts += av_rescale_q(s->rendered, (AVRational){ 1, RATE }, avctx->pkt_timebase);
+    s->rendered += n;
+    s->pending_frames = 0;
+    return 0;
+}
+
+static void libatmos_speakers_flush(AVCodecContext *avctx)
+{
+    LibAtmosContext *s = avctx->priv_data;
+
+    ar_drop(s->session);
+    s->session = speaker_session(avctx->codec_id);
+    if (s->core)
+        avcodec_flush_buffers(s->core);
+    s->pending_frames = 0;
+    s->rendered = 0;
+    s->has_origin = 0;
+    s->eof = 0;
+}
+
+#define LIBATMOS_SPEAKERS_DECODER(short_, long_, id_)                            \
+const FFCodec ff_libatmos_speakers_##short_##_decoder = {                           \
+    .p.name         = "libatmos_speakers_" #short_,                                 \
+    CODEC_LONG_NAME(long_ " for built-in speakers (atmos-render)"),               \
+    .p.type         = AVMEDIA_TYPE_AUDIO,                                         \
+    .p.id           = id_,                                                         \
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_CHANNEL_CONF, \
+    .p.wrapper_name = "libatmos",                                                 \
+    .priv_data_size = sizeof(LibAtmosContext),                                    \
+    .init           = libatmos_speakers_init,                                     \
+    .close          = libatmos_speakers_close,                                    \
+    FF_CODEC_RECEIVE_FRAME_CB(libatmos_speakers_receive_frame),                   \
+    .flush          = libatmos_speakers_flush,                                    \
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                                  \
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),                                         \
+};
+
+LIBATMOS_SPEAKERS_DECODER(truehd, "TrueHD", AV_CODEC_ID_TRUEHD)
+LIBATMOS_SPEAKERS_DECODER(eac3, "E-AC-3", AV_CODEC_ID_EAC3)
+LIBATMOS_SPEAKERS_DECODER(ac3, "AC-3", AV_CODEC_ID_AC3)
