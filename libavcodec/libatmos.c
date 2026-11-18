@@ -29,7 +29,8 @@
  * atmos-render rebuilds the objects from it and the bitstream's EMDF (JOC, OAMD).
  *
  * libatmos_speakers_* instead render the stream for two built-in speakers, as Dolby Atmos for
- * built-in speakers does on Windows: plain stereo at 48 kHz that any player can play.
+ * built-in speakers does on Windows, and libatmos_binaural_* for headphones, as Dolby's Reference
+ * Player does (the browser player's render): plain stereo at 48 kHz that any player can play.
  */
 
 #include <atmos_objects.h>
@@ -71,7 +72,8 @@ typedef struct LibAtmosContext {
     uint64_t rendered;
 } LibAtmosContext;
 
-static int open_core(AVCodecContext *avctx, LibAtmosContext *s)
+/* heavy: Windows' RF mode (heavy compression); otherwise the Reference Player's LINE mode. */
+static int open_core(AVCodecContext *avctx, LibAtmosContext *s, int heavy)
 {
     const AVCodec *codec = avcodec_find_decoder(avctx->codec_id == AV_CODEC_ID_AC3 ?
                                                 AV_CODEC_ID_AC3 : AV_CODEC_ID_EAC3);
@@ -86,9 +88,10 @@ static int open_core(AVCodecContext *avctx, LibAtmosContext *s)
         return AVERROR(ENOMEM);
     s->core->request_sample_fmt = AV_SAMPLE_FMT_FLTP;
     s->core->pkt_timebase = avctx->pkt_timebase;
-    /* Windows' DD+ decoder's RF mode, as atmos-render's Loudness::Windows expects */
+    /* Windows' DD+ decoder's RF mode, as atmos-render's Loudness::Windows expects, or LINE mode
+     * for Loudness::Reference */
     av_dict_set(&opts, "drc_scale", "1", 0);
-    av_dict_set(&opts, "heavy_compr", "1", 0);
+    av_dict_set(&opts, "heavy_compr", heavy ? "1" : "0", 0);
     av_dict_set(&opts, "target_level", "-31", 0);
     ret = avcodec_open2(s->core, codec, &opts);
     av_dict_free(&opts);
@@ -109,7 +112,7 @@ static av_cold int libatmos_init(AVCodecContext *avctx)
     s->pkt = av_packet_alloc();
     if (!s->objects || !s->pkt)
         return AVERROR(ENOMEM);
-    if (s->codec == ATMOS_OBJECTS_EAC3 && (ret = open_core(avctx, s)) < 0)
+    if (s->codec == ATMOS_OBJECTS_EAC3 && (ret = open_core(avctx, s, 1)) < 0)
         return ret;
 
     avctx->sample_rate = RATE;
@@ -305,13 +308,23 @@ const FFCodec ff_libatmos_##short_##_decoder = {                                
 LIBATMOS_DECODER(truehd, "TrueHD", AV_CODEC_ID_TRUEHD)
 LIBATMOS_DECODER(eac3, "E-AC-3", AV_CODEC_ID_EAC3)
 
-/* ---- libatmos_speakers_*: rendered for built-in speakers ---- */
+/* ---- libatmos_speakers_* and libatmos_binaural_*: rendered to stereo ---- */
 
-static AtmosRenderSession *speaker_session(enum AVCodecID id)
+static int is_binaural(AVCodecContext *avctx)
 {
-    /* Every element Near and Windows' loudness: Windows' own renderer for a stereo endpoint. */
-    AtmosRenderSession *session = id == AV_CODEC_ID_TRUEHD ? ar_new(1) : ar_new_eac3(1, true);
+    return !strncmp(avctx->codec->name, "libatmos_binaural_", 18);
+}
 
+static AtmosRenderSession *render_session(AVCodecContext *avctx)
+{
+    AtmosRenderSession *session;
+
+    /* Headphones: the stream's own render modes and the Reference Player's loudness, as the
+     * browser player renders. Speakers: every element Near and Windows' loudness, Windows' own
+     * renderer for a stereo endpoint. */
+    if (is_binaural(avctx))
+        return avctx->codec_id == AV_CODEC_ID_TRUEHD ? ar_new(0) : ar_new_eac3(0, false);
+    session = avctx->codec_id == AV_CODEC_ID_TRUEHD ? ar_new(1) : ar_new_eac3(1, true);
     if (session && !ar_render_for_speakers(session)) {
         ar_drop(session);
         session = NULL;
@@ -328,11 +341,11 @@ static av_cold int libatmos_speakers_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_ERROR, "Only %d Hz is supported, not %d\n", RATE, avctx->sample_rate);
         return AVERROR(ENOSYS);
     }
-    s->session = speaker_session(avctx->codec_id);
+    s->session = render_session(avctx);
     s->pkt = av_packet_alloc();
     if (!s->session || !s->pkt)
         return AVERROR(ENOMEM);
-    if (avctx->codec_id != AV_CODEC_ID_TRUEHD && (ret = open_core(avctx, s)) < 0)
+    if (avctx->codec_id != AV_CODEC_ID_TRUEHD && (ret = open_core(avctx, s, !is_binaural(avctx))) < 0)
         return ret;
 
     avctx->sample_rate = RATE;
@@ -387,7 +400,7 @@ static void libatmos_speakers_flush(AVCodecContext *avctx)
     LibAtmosContext *s = avctx->priv_data;
 
     ar_drop(s->session);
-    s->session = speaker_session(avctx->codec_id);
+    s->session = render_session(avctx);
     if (s->core)
         avcodec_flush_buffers(s->core);
     s->pending_frames = 0;
@@ -396,10 +409,10 @@ static void libatmos_speakers_flush(AVCodecContext *avctx)
     s->eof = 0;
 }
 
-#define LIBATMOS_SPEAKERS_DECODER(short_, long_, id_)                            \
-const FFCodec ff_libatmos_speakers_##short_##_decoder = {                           \
-    .p.name         = "libatmos_speakers_" #short_,                                 \
-    CODEC_LONG_NAME(long_ " for built-in speakers (atmos-render)"),               \
+#define LIBATMOS_STEREO_DECODER(kind_, short_, long_, id_)                       \
+const FFCodec ff_libatmos_##kind_##_##short_##_decoder = {                          \
+    .p.name         = "libatmos_" #kind_ "_" #short_,                               \
+    CODEC_LONG_NAME(long_),                                                       \
     .p.type         = AVMEDIA_TYPE_AUDIO,                                         \
     .p.id           = id_,                                                         \
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_CHANNEL_CONF, \
@@ -413,6 +426,9 @@ const FFCodec ff_libatmos_speakers_##short_##_decoder = {                       
     CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),                                         \
 };
 
-LIBATMOS_SPEAKERS_DECODER(truehd, "TrueHD", AV_CODEC_ID_TRUEHD)
-LIBATMOS_SPEAKERS_DECODER(eac3, "E-AC-3", AV_CODEC_ID_EAC3)
-LIBATMOS_SPEAKERS_DECODER(ac3, "AC-3", AV_CODEC_ID_AC3)
+LIBATMOS_STEREO_DECODER(speakers, truehd, "TrueHD for built-in speakers (atmos-render)", AV_CODEC_ID_TRUEHD)
+LIBATMOS_STEREO_DECODER(speakers, eac3, "E-AC-3 for built-in speakers (atmos-render)", AV_CODEC_ID_EAC3)
+LIBATMOS_STEREO_DECODER(speakers, ac3, "AC-3 for built-in speakers (atmos-render)", AV_CODEC_ID_AC3)
+LIBATMOS_STEREO_DECODER(binaural, truehd, "TrueHD for headphones (atmos-render)", AV_CODEC_ID_TRUEHD)
+LIBATMOS_STEREO_DECODER(binaural, eac3, "E-AC-3 for headphones (atmos-render)", AV_CODEC_ID_EAC3)
+LIBATMOS_STEREO_DECODER(binaural, ac3, "AC-3 for headphones (atmos-render)", AV_CODEC_ID_AC3)
